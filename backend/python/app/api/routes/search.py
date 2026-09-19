@@ -85,9 +85,37 @@ async def search(
         rewrite_chain, expansion_chain = setup_query_transformation(transform_llm)
 
         # Run query transformations in parallel
-        rewritten_query, expanded_queries = await asyncio.gather(
-            rewrite_chain.ainvoke(body.query), expansion_chain.ainvoke(body.query)
-        )
+        # SEARCH_QUERY_TRANSFORM=off searches the user's literal query and
+        # nothing else -- no rewrite, no expansion, no LLM round-trip. Default
+        # is "on", so upstream behaviour is unchanged unless asked for.
+        #
+        # The transformation is not merely noisy. Logging the queries actually
+        # sent shows the prompt's own label ("Rewritten Query:") embedded as
+        # search text, unfilled placeholders ("[insert PO number]",
+        # "[Company Name]") embedded beside it, an instruction-shaped sentence
+        # that no document chunk resembles, and invented domain terms
+        # ("SAP/Oracle/Ariba") absent from the corpus. The query "test" became
+        # "How to prepare for a high-school chemistry test: 4-week study
+        # plan...". Two identical golden runs flipped 6 of 21 questions.
+        #
+        # Turning it off is what makes retrieval measurable at all.
+        # Two switches, because on this bench the env var is unreachable: it
+        # can only be set by recreating the container, and a recreate silently
+        # reverts every patch including this one (#25). The flag FILE survives a
+        # plain restart, which is the only lever a container-local patch series
+        # actually has. Same tell as before -- a one-line env change costs more
+        # than a code change.
+        import os as _os
+        _off = _os.getenv("SEARCH_QUERY_TRANSFORM", "on").strip().lower() in (
+            "off", "0", "false", "no", "none"
+        ) or _os.path.exists("/app/.search-transform-off")
+        if _off:
+            logger.info("Query transformation disabled; searching the literal query")
+            rewritten_query, expanded_queries = "", ""
+        else:
+            rewritten_query, expanded_queries = await asyncio.gather(
+                rewrite_chain.ainvoke(body.query), expansion_chain.ainvoke(body.query)
+            )
 
         logger.debug(f"Rewritten query: {rewritten_query}")
         logger.debug(f"Expanded queries: {expanded_queries}")
