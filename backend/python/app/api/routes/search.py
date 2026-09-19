@@ -132,14 +132,116 @@ async def search(
         if rewritten_query.strip() and rewritten_query.strip() not in queries:
             queries.append(rewritten_query.strip())
         queries.extend([q for q in expanded_queries_list if q not in queries])
+        # Knowledge Forge patch 22 (#97): retrieve WIDE, rerank, trim.
+        #
+        # Golden v7 on this index: recall@10 85%, recall@20 94% -- three of the
+        # five k=10 misses are retrieved but mis-ordered (ros-sow-total rank 19,
+        # ros-discounts 11, paychex-ssp-nonprod 11). Reranking only the top
+        # `limit` cannot reach them: the first cut of this patch reranked 9-14
+        # candidates for limit=10 and moved nothing. A reranker is worth having
+        # only over a candidate pool WIDER than the answer set, so when the flag
+        # is on the retrieve is widened to RERANK_CANDIDATES (default 40) and the
+        # reranked list is trimmed back to the caller's limit.
+        #
+        # Uses the CrossEncoder PipesHub already ships (containers/query.py ->
+        # RerankerService, BAAI/bge-reranker-base); the agent path consumes it,
+        # the search path never had a call site. Two switches because setting an
+        # env var needs a container recreate, and a recreate reverts this patch
+        # series (#25). `records` is untouched: it is built from a SET of record
+        # ids and carries no relevance order. Fails OPEN -- on any error the
+        # retriever's own order and limit stand.
+        import os as _os
+        _rerank_on = _os.getenv("SEARCH_RERANK", "off").strip().lower() in (
+            "on", "1", "true", "yes"
+        ) or _os.path.exists("/app/.search-rerank-on")
+        _limit = body.limit
+        _pool = _limit
+        if _rerank_on:
+            try:
+                _pool = max(int(_limit or 0), int(_os.getenv("RERANK_CANDIDATES", "40")))
+            except (TypeError, ValueError):
+                _pool = _limit
+
         results = await retrieval_service.search_with_filters(
             queries=queries,
             org_id=request.state.user.get("orgId"),
             user_id=request.state.user.get("userId"),
-            limit=body.limit,
+            limit=_pool,
             filter_groups=updated_filters,
             knowledge_search=True,
         )
+
+        if _rerank_on and isinstance(results, dict) and results.get("searchResults"):
+            try:
+                import asyncio as _asyncio
+                import json as _json
+                import urllib.request as _urlreq
+
+                from app.config.constants.service import config_node_constants as _cnc
+
+                _cfg_service = request.app.container.config_service()
+                _ai = await _cfg_service.get_config(_cnc.AI_MODELS.value, use_cache=False)
+                _key = ""
+                for _entry in ((_ai or {}).get("llm") or []) + ((_ai or {}).get("embedding") or []):
+                    if (_entry.get("provider") or "").lower() == "openrouter":
+                        _key = ((_entry.get("configuration") or {}).get("apiKey") or "").strip()
+                        if _key:
+                            break
+                if not _key:
+                    raise RuntimeError("no openRouter apiKey in /services/aiModels")
+
+                _docs, _keep = [], []
+                for _i, _r in enumerate(results["searchResults"]):
+                    _c = _r.get("content")
+                    if isinstance(_c, list) and _c:
+                        _c = _c[0]
+                    if isinstance(_c, str) and _c.strip():
+                        _docs.append(_c[:4000])
+                        _keep.append(_i)
+                if not _docs:
+                    raise RuntimeError("no rerankable content in searchResults")
+
+                _model = _os.getenv("RERANK_MODEL", "voyageai/rerank-2.5-lite")
+                _payload = _json.dumps({
+                    "model": _model, "query": body.query,
+                    "documents": _docs, "top_n": _limit or len(_docs),
+                }).encode()
+
+                def _call() -> dict:
+                    _req = _urlreq.Request(
+                        "https://openrouter.ai/api/v1/rerank", data=_payload,
+                        headers={"Authorization": "Bearer " + _key,
+                                 "Content-Type": "application/json"},
+                    )
+                    with _urlreq.urlopen(_req, timeout=20) as _resp:
+                        return _json.loads(_resp.read())
+
+                _rr = await _asyncio.to_thread(_call)
+                _ranked = []
+                for _hit in (_rr.get("results") or []):
+                    _idx = _hit.get("index")
+                    if isinstance(_idx, int) and 0 <= _idx < len(_keep):
+                        _doc = results["searchResults"][_keep[_idx]]
+                        _doc["reranker_score"] = _hit.get("relevance_score")
+                        _ranked.append(_doc)
+                if not _ranked:
+                    raise RuntimeError("rerank returned no usable indices")
+
+                _before = len(results["searchResults"])
+                results["searchResults"] = _ranked[: _limit or None]
+                logger.info(
+                    "Reranked %d candidates -> %d via %s (pool=%s limit=%s cost=%s)",
+                    _before, len(results["searchResults"]), _model, _pool, _limit,
+                    (_rr.get("usage") or {}).get("cost"),
+                )
+            except Exception as _rerank_error:
+                logger.warning(
+                    "Rerank skipped (%s: %s); keeping retriever order",
+                    type(_rerank_error).__name__, _rerank_error,
+                )
+                if isinstance(results, dict) and isinstance(results.get("searchResults"), list):
+                    results["searchResults"] = results["searchResults"][: _limit or None]
+
         custom_status_code = results.get("status_code", 500)
         logger.info(f"Custom status code: {custom_status_code}")
 
