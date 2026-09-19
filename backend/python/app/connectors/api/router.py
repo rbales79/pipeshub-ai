@@ -6805,7 +6805,9 @@ async def save_connector_instance_filters(
             logger.error("Filters not found. Please configure first.")
             config["filters"] = {}
 
-        config["filters"]["values"] = filter_selections
+        # Knowledge Forge patch 21 (#48): the loader reads filters.sync.values,
+        # not filters.values -- writing the latter is a silent no-op.
+        config["filters"].setdefault("sync", {})["values"] = filter_selections
 
         # Save updated config
         await config_service.set_config(config_path, config)
