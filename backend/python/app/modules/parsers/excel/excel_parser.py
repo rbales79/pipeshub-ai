@@ -1440,7 +1440,11 @@ Respond with ONLY a JSON object with EXACTLY {column_count} headers:
             if use_llm_for_rows:
                 self.logger.info(f"Using LLM for row processing (under threshold of {threshold})")
                 # Process rows in batches of 50 in parallel using LLM
-                batch_size = 50
+                # Knowledge Forge patch 28 (#105): batch by cells, not a fixed 50 rows. A 50-row
+                # batch of a 21-column sheet took 170 s and fell back to key:value text; 10 rows
+                # took 24 s and succeeded. rows = budget // columns, clamped to 1..50.
+                _cell_budget = max(1, int(os.getenv("EXCEL_ROW_LLM_CELL_BUDGET", "250")))
+                batch_size = max(1, min(50, _cell_budget // max(1, len(table["headers"]))))
 
                 # Create batches
                 batches = []
