@@ -638,6 +638,30 @@ class IndexingRedisStreamsConsumer(IMessagingConsumer):
                     exc,
                 )
 
+    # Knowledge Forge patch 27 (#80): deliveries this consumer caused by releasing an entry
+    # it was only holding. Written before the entry can be re-claimed; read by the backstop.
+    _KF_RELEASE_CREDIT_TTL_S = 7 * 24 * 3600
+
+    @staticmethod
+    def _kf_release_credit_key(stream: str, message_id: str) -> str:
+        return f"kf:release-credit:{stream}:{message_id}"
+
+    async def _kf_flush_release_credits(self) -> None:
+        credits = getattr(self, "_kf_release_credits", None)
+        if not credits or self.redis is None:
+            return
+        self._kf_release_credits = []
+        try:
+            pipe = self.redis.pipeline(transaction=False)
+            for stream, message_id in credits:
+                key = self._kf_release_credit_key(stream, message_id)
+                pipe.incr(key)
+                pipe.expire(key, self._KF_RELEASE_CREDIT_TTL_S)
+            await pipe.execute()
+        except Exception as e:
+            # Fail toward upstream behaviour: without a credit the backstop counts as before.
+            self.logger.warning("Could not record %d release credit(s): %s", len(credits), e)
+
     async def _should_dead_letter(
         self,
         topic: str,
@@ -716,7 +740,15 @@ class IndexingRedisStreamsConsumer(IMessagingConsumer):
             self.logger.error("Error checking delivery count: %s", e)
             return False
 
-        if times_delivered >= delivery_backstop:
+        # Knowledge Forge patch 27 (#80): discount re-claims this consumer caused itself.
+        self_released = 0
+        try:
+            self_released = int(
+                await self.redis.get(self._kf_release_credit_key(topic, message_id)) or 0  # type: ignore
+            )
+        except Exception as e:
+            self.logger.debug("Could not read release credits for %s: %s", message_id, e)
+        if times_delivered - self_released >= delivery_backstop:
             return await self._abandon_or_leave_pending(
                 message_id,
                 tracking_id,
@@ -1228,6 +1260,13 @@ class IndexingRedisStreamsConsumer(IMessagingConsumer):
             for _stream, message_id, *_rest in stale_parked:
                 self._held_entries.pop(message_id, None)
 
+        # Knowledge Forge patch 27 (#80): every entry released here will be re-claimed by
+        # XAUTOCLAIM, which counts a delivery. Queue a credit so the backstop can discount it.
+        credits = getattr(self, "_kf_release_credits", None)
+        if credits is None:
+            credits = self._kf_release_credits = []
+        credits.extend((stream, message_id) for stream, message_id, *_r in dropped)
+        credits.extend((stream, message_id) for stream, message_id, *_r in stale_parked)
         released = len(dropped) + len(stale_parked)
         if released:
             metrics.record_dwell_exceeded("redis", released)
@@ -1451,6 +1490,7 @@ class IndexingRedisStreamsConsumer(IMessagingConsumer):
         if scheduler is None:
             return
         self.__sweep_stale_buffered()
+        await self._kf_flush_release_credits()  # Knowledge Forge patch 27 (#80)
         await self.__drain_deferred()
         # Parked entries are held in memory too, so they count against the
         # buffer budget -- that budget is what bounds this consumer's memory.
