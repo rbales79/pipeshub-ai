@@ -891,7 +891,10 @@ class SalesforceConnector(BaseConnector):
         while not response.data.get("done", True):
             next_url = response.data.get("nextRecordsUrl")
             if not next_url:
-                break
+                # Knowledge Forge patch 38 (#170): "there is more" with nowhere to get it is a
+                # truncated result. Upstream ended the stream normally here.
+                self.logger.error("SOQL result truncated: done is false and there is no nextRecordsUrl. Query: %s", q)
+                raise RuntimeError("SOQL result truncated: done is false and there is no nextRecordsUrl")
             response = await self.data_source.soql_query_next(next_url=next_url)
             if not response.success:
                 self.logger.error(
