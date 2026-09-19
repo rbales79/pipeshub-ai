@@ -2970,12 +2970,13 @@ class SharePointConnector(BaseConnector):
             async with self.rate_limiter:
                 # Use the correct Graph API structure for drive permissions
                 # For SharePoint, we need to get the root item first, then its permissions
-                root_item = await self._safe_api_call(
-                    self.client.sites.by_site_id(encoded_site_id).drives.by_drive_id(drive_id).root.get()
-                )
+                # sites/{id}/drives/{id} returns a STUB builder (get/to_get_request_information/
+                # with_url only) - no .root, no .items. The top-level drives builder has both.
+                _drive = self.client.drives.by_drive_id(drive_id)
+                root_item = await self._safe_api_call(_drive.root.get())
                 if root_item:
                     perms_response = await self._safe_api_call(
-                        self.client.sites.by_site_id(encoded_site_id).drives.by_drive_id(drive_id).items.by_drive_item_id(root_item.id).permissions.get()
+                        _drive.items.by_drive_item_id(root_item.id).permissions.get()
                     )
                 else:
                     perms_response = None
