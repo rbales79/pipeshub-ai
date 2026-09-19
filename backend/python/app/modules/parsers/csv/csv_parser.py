@@ -36,6 +36,15 @@ from app.modules.parsers.excel.prompt_template import (
 )
 from app.utils.aimodels import coerce_message_content_to_text
 from app.utils.indexing_helpers import format_rows_with_index, generate_simple_row_text
+
+
+def _kf_row_text_with_values(row_text, row_data):
+    """Knowledge Forge patch 30 (#117): an LLM row sentence plus the row's values verbatim."""
+    values = generate_simple_row_text(row_data) if isinstance(row_data, dict) else ""
+    text = (row_text or "").strip()
+    if not values or values in text:
+        return text or values
+    return f"{text}\n{values}" if text else values
 from app.utils.logger import create_logger
 from app.utils.streaming import (
     invoke_with_row_descriptions_and_reflection,
@@ -1023,7 +1032,8 @@ class CSVParser:
                                 type=BlockType.TABLE_ROW,
                                 format=DataFormat.JSON,
                                 data={
-                                    "row_natural_language_text": row_text,
+                                    # Knowledge Forge patch 30 (#117): the sentence paraphrases; keep the values.
+                                    "row_natural_language_text": _kf_row_text_with_values(row_text, row),
                                     "row_number": actual_row_number,
                                 },
                                 parent_index=table_group_index,
