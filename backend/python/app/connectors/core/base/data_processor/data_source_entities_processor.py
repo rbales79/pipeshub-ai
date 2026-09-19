@@ -1561,14 +1561,22 @@ class DataSourceEntitiesProcessor:
             existing = await tx_store.get_record_by_key(record_id)
             await tx_store.delete_parent_child_edge_to_record(record_id)
             await tx_store.delete_record_by_key(record_id)
-            vrid = getattr(existing, "virtual_record_id", None) if existing is not None else None
+            # Knowledge Forge patch 32 (#134): on Neo4j get_record_by_key returns a dict,
+            # and getattr() on a dict is always None — so this event was never published
+            # and the vectors and parsed copy outlived every connector delete.
+            def _kf_field(attr: str, key: str, default=None):  # noqa: ANN001, ANN202
+                if isinstance(existing, dict):
+                    return existing.get(key, default)
+                return getattr(existing, attr, default)
+
+            vrid = _kf_field("virtual_record_id", "virtualRecordId") if existing is not None else None
             if isinstance(vrid, str) and vrid:
                 event_payload = {
-                    "orgId": getattr(existing, "org_id", self.org_id),
-                    "recordId": getattr(existing, "id", None) or record_id,
-                    "version": getattr(existing, "version", 1),
+                    "orgId": _kf_field("org_id", "orgId", self.org_id),
+                    "recordId": _kf_field("id", "id") or _kf_field("id", "_key") or record_id,
+                    "version": _kf_field("version", "version", 1),
                     "virtualRecordId": vrid,
-                    "connectorId": getattr(existing, "connector_id", None),
+                    "connectorId": _kf_field("connector_id", "connectorId"),
                 }
         await self._publish_delete_events(
             {"payloads": [event_payload]} if event_payload else None

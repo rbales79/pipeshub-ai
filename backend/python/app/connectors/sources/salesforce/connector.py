@@ -5518,7 +5518,24 @@ class SalesforceConnector(BaseConnector):
         """
         try:
             if record_update.is_deleted and record_update.external_record_id:
-                await self.data_entities_processor.on_record_deleted(record_id=record_update.external_record_id)
+                # Knowledge Forge patch 32 (#134, #47): on_record_deleted takes the INTERNAL
+                # record key. This passed the source system's id, the lookup found nothing,
+                # and the delete was a silent no-op. Resolve it here, where the connector id
+                # that makes an external id unambiguous is known.
+                async with self.data_store_provider.transaction() as tx_store:
+                    kf_existing = await tx_store.get_record_by_external_id(
+                        self.connector_id, record_update.external_record_id
+                    )
+                if kf_existing is None:
+                    self.logger.info(
+                        f"Deleted at source, not in the index: {record_update.external_record_id}"
+                    )
+                    return
+                self.logger.info(
+                    f"Deleted at source, deleting record {kf_existing.id} "
+                    f"({record_update.external_record_id})"
+                )
+                await self.data_entities_processor.on_record_deleted(record_id=kf_existing.id)
             elif record_update.is_updated and record_update.record:
                 if record_update.content_changed:
                     self.logger.debug(f"Content changed for record: {record_update.record.record_name}")
