@@ -2701,11 +2701,110 @@ class SharePointConnector(BaseConnector):
                 )
 
             self.logger.info(f"Found {len(permissions_dict)} unique permissions for site {site_id}")
+            if not permissions_dict:
+                self.logger.warning(
+                    f"Site permissions empty for {site_id} via SharePoint REST — "
+                    f"falling back to Graph drive-root permissions"
+                )
+                return await self._get_site_permissions_via_graph(site_id)
             return list(permissions_dict.values())
 
         except Exception as e:
             self.logger.error(f"❌ Error resolving site permissions: {e}")
+            return await self._get_site_permissions_via_graph(site_id)
+
+    async def _get_site_permissions_via_graph(self, site_id: str) -> List[Permission]:
+        """Site ACL via Graph, for deployments without a SharePoint REST grant.
+
+        `/_api/web/sitegroups` requires a SharePoint-resource token; an ordinary
+        Graph app gets 401 and the caller silently ends up with no site
+        permissions at all. The site's DEFAULT drive root carries the same site
+        groups (Owners / Members / Visitors) and IS readable with Sites.Read.All,
+        so use it rather than leaving the RecordGroup unreachable.
+
+        The root item's permission collection is NOT a site ACL, though: it also
+        carries grants scoped to that one library — direct (non-inherited) grants
+        and sharing links. Returning those as the site ACL would authorize the
+        site RecordGroup for a principal who only has access to the default
+        document library, and the traversal would then descend into its sibling
+        libraries. So only ACEs the root INHERITED are kept; see
+        `_inherited_site_aces`.
+
+        Returns [] on failure, and on a successful response with nothing
+        inherited — an empty ACL is safer than a wrong one, and that has to hold
+        for a 200 as much as for an exception.
+        """
+        try:
+            encoded_site_id = self._construct_site_url(site_id)
+            async with self.rate_limiter:
+                # patch-04 rev3: reviewed ACE filter, top-level drive builder
+                # `.drive` is a DriveRequestBuilder and has no `.root`; resolve the
+                # default drive to an id, then address it through the TOP-LEVEL
+                # `client.drives.by_drive_id(...)`. The site-scoped
+                # `sites.by_site_id(s).drives.by_drive_id(id)` is a stub with no
+                # `.root` and no `.items` (patch 05); using it here threw on every
+                # site and emptied the site ACLs for one full sync.
+                default_drive = await self._safe_api_call(
+                    self.client.sites.by_site_id(encoded_site_id).drive.get()
+                )
+                if not default_drive or not getattr(default_drive, "id", None):
+                    return []
+                drive_builder = self.client.drives.by_drive_id(default_drive.id)
+                root_item = await self._safe_api_call(drive_builder.root.get())
+                if not root_item:
+                    return []
+                perms_response = await self._safe_api_call(
+                    drive_builder.items.by_drive_item_id(root_item.id).permissions.get()
+                )
+
+            if not perms_response or not perms_response.value:
+                return []
+
+            site_aces = self._inherited_site_aces(perms_response.value)
+            if not site_aces:
+                self.logger.info(
+                    f"Graph fallback found no site-scoped ACE on the default drive root "
+                    f"for {site_id} ({len(perms_response.value)} permission(s) examined, "
+                    f"all library-scoped)"
+                )
+                return []
+
+            permissions = await self._convert_to_permissions(site_aces)
+            self.logger.info(
+                f"Graph fallback resolved {len(permissions)} site permission(s) for {site_id} "
+                f"from {len(site_aces)} inherited ACE(s)"
+            )
+            return permissions
+
+        except Exception as e:
+            self.logger.warning(f"⚠️ Graph site-permission fallback failed for {site_id}: {e}")
             return []
+
+    @staticmethod
+    def _inherited_site_aces(root_permissions: List) -> List:
+        """Keep only the ACEs on a drive root that represent SITE-level access.
+
+        A drive root's permission collection mixes two things: ACEs inherited
+        from the site above it, and grants made on that library alone. Only the
+        first kind describes the site.
+
+        - A permission with a `link` facet is a sharing link on this library.
+          Never site-wide.
+        - A permission without `inherited_from` was granted directly on this
+          root. It authorizes this document library, not the site — promoting it
+          would let a principal with access to one library reach every sibling
+          library through the RecordGroup traversal.
+
+        Anything whose scope cannot be established is dropped, not kept.
+        """
+        inherited: List = []
+        for perm in root_permissions or []:
+            if getattr(perm, "link", None):
+                continue
+            if not getattr(perm, "inherited_from", None):
+                continue
+            inherited.append(perm)
+        return inherited
 
     async def _get_sharepoint_group_users(self, site_url: str, group_type: str, access_token: str) -> List[dict]:
         """
