@@ -1331,7 +1331,8 @@ class EventProcessor:
                 ):
                     yield event
 
-            elif extension == ExtensionTypes.XLS.value or mime_type == MimeTypes.XLS.value:
+            elif (extension == ExtensionTypes.XLS.value or mime_type == MimeTypes.XLS.value) \
+                    and not str(record_name or "").lower().endswith((".csv", ".tsv")):  # Knowledge Forge patch 20 (#28)
                 async for event in self.processor.process_xls_document(
                     recordName=record_name,
                     recordId=record_id,
@@ -1345,7 +1346,8 @@ class EventProcessor:
                 ):
                     yield event
 
-            elif extension == ExtensionTypes.CSV.value or mime_type == MimeTypes.CSV.value:
+            elif extension == ExtensionTypes.CSV.value or mime_type == MimeTypes.CSV.value \
+                    or str(record_name or "").lower().endswith(".csv"):
                 async for event in self.processor.process_delimited_document(
                     recordName=record_name,
                     recordId=record_id,
@@ -1356,7 +1358,8 @@ class EventProcessor:
                 ):
                     yield event
 
-            elif extension == ExtensionTypes.TSV.value or mime_type == MimeTypes.TSV.value:
+            elif extension == ExtensionTypes.TSV.value or mime_type == MimeTypes.TSV.value \
+                    or str(record_name or "").lower().endswith(".tsv"):
                 async for event in self.processor.process_delimited_document(
                     recordName=record_name,
                     recordId=record_id,
