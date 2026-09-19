@@ -6314,6 +6314,87 @@ class SalesforceConnector(BaseConnector):
             )
         return confirmed
 
+    # Knowledge Forge patch 34 (#134): a FILE record stands for a (document, parent) link —
+    # external id `<ContentDocumentId>-<LinkedEntityId>`, or a bare document id. It is stale
+    # when that link, or that document, is gone. An id that does not parse is never deleted.
+    async def _kf_file_records_missing_at_source(self, api_version: str, max_fraction: float) -> list:
+        indexed = await self.data_entities_processor.get_records_by_record_type(
+            self.connector_id, RecordType.FILE
+        )
+        parsed = []
+        unreadable = 0
+        for record in indexed:
+            doc_id, _, linked_id = (record.external_record_id or "").partition("-")
+            ids = [doc_id] + ([linked_id] if linked_id else [])
+            if all(len(i) == 18 and i.isalnum() and i.isascii() for i in ids):
+                parsed.append((record, doc_id, linked_id or None))
+            else:
+                unreadable += 1
+        if unreadable:
+            self.logger.warning(
+                f"Source-delete pass: {unreadable} file record(s) have an external id that is not "
+                f"<document>[-<parent>]; left alone."
+            )
+        if not parsed:
+            return []
+
+        doc_ids = sorted({doc_id for _, doc_id, _ in parsed})
+        live_docs = set()
+        live_links = set()
+        binned_links = set()
+        for i in range(0, len(doc_ids), 200):
+            in_clause = "','".join(doc_ids[i : i + 200])
+            async for page in self._soql_query_paginated(
+                api_version=api_version,
+                q=f"SELECT Id FROM ContentDocument WHERE IsDeleted = false AND Id IN ('{in_clause}')",
+                queryAll=True,
+            ):
+                live_docs.update(row.get("Id") for row in page if row.get("Id"))
+            async for page in self._soql_query_paginated(
+                api_version=api_version,
+                q=(
+                    "SELECT ContentDocumentId, LinkedEntityId, IsDeleted FROM ContentDocumentLink "
+                    f"WHERE ContentDocumentId IN ('{in_clause}')"
+                ),
+                queryAll=True,
+            ):
+                # Salesforce refuses IsDeleted in this WHERE ("filtering on non-id fields is only
+                # permitted ... LinkedEntityId"), so the recycle bin is filtered out here.
+                live_links.update(
+                    (row.get("ContentDocumentId"), row.get("LinkedEntityId"))
+                    for row in page if not row.get("IsDeleted")
+                )
+                binned_links.update(
+                    (row.get("ContentDocumentId"), row.get("LinkedEntityId"))
+                    for row in page if row.get("IsDeleted")
+                )
+
+        missing = [
+            record for record, doc_id, linked_id in parsed
+            if doc_id not in live_docs or (linked_id and (doc_id, linked_id) not in live_links)
+        ]
+        if not missing:
+            return []
+        if not live_docs or len(missing) <= self._KF_SOURCE_DELETE_FLOOR:
+            # #170: a detached link Salesforce still holds as IsDeleted is confirmed by that row;
+            # everything else needs its DOCUMENT in the Recycle Bin.
+            doc_of = {id(record): (doc_id, linked_id) for record, doc_id, linked_id in parsed}
+            unlinked = [r for r in missing if doc_of[id(r)][0] in live_docs and doc_of[id(r)] in binned_links]
+            rest = [r for r in missing if not (doc_of[id(r)][0] in live_docs and doc_of[id(r)] in binned_links)]
+            if rest:
+                rest = await self._kf_only_confirmed(
+                    api_version, "ContentDocument", "ContentDocument", rest, lambda r: doc_of[id(r)][0]
+                )
+            return unlinked + rest
+        if len(missing) > max_fraction * len(parsed):
+            self.logger.error(
+                f"Source-delete pass REFUSED for ContentDocument: {len(missing)} of {len(parsed)} indexed "
+                f"file records are missing at the source, over the {max_fraction:.0%} limit. Nothing deleted. "
+                f"If this is a real bulk delete, set KF_SOURCE_DELETE_MAX_FRACTION=1 for one sync."
+            )
+            return []
+        return missing
+
     async def _kf_delete_records_missing_at_source(self, api_version: str) -> int:
         import os
 
@@ -6350,6 +6431,10 @@ class SalesforceConnector(BaseConnector):
                     )
                     continue
                 plan.append((sobject, missing))
+            # Knowledge Forge patch 34 (#134): inside the try — a failed file listing aborts the pass.
+            kf_files = await self._kf_file_records_missing_at_source(api_version, max_fraction)
+            if kf_files:
+                plan.append(("File", kf_files))
         except Exception as e:
             self.logger.error(f"Source-delete pass aborted, nothing deleted: {e}", exc_info=True)
             return 0
