@@ -710,11 +710,26 @@ class RetrievalService:
                 flattened_results = await get_flattened_results(new_type_results, self.blob_store, org_id, is_multimodal_llm, virtual_record_id_to_record, from_retrieval_service=True)
                 for result in flattened_results:
                     block_type = result.get("block_type")
-                    if block_type == GroupType.TABLE.value or block_type in valid_group_labels:
-                        _, child_results = result.get("content")
+                    content = result.get("content")
+                    is_group = (block_type == GroupType.TABLE.value
+                                or block_type in valid_group_labels)
+                    # A grouped block type does NOT guarantee grouped content.
+                    # get_flattened_results emits (summary, children) only for
+                    # TABLE-shaped blocks; a `code` block arrives as a plain
+                    # string, and unpacking a 4,914-character string into two
+                    # names raised ValueError -- which the handler below turned
+                    # into a 500 for the WHOLE query. One bad member must not
+                    # cost the entire result set, so check the shape.
+                    if is_group and isinstance(content, tuple) and len(content) == 2:
+                        _, child_results = content
                         for child in child_results:
                             final_search_results.append(child)
                     else:
+                        if is_group:
+                            self.logger.debug(
+                                "Group block %s carried non-pair content (%s); "
+                                "treating as a leaf result.",
+                                block_type, type(content).__name__)
                         final_search_results.append(result)
 
             final_search_results = sorted(
