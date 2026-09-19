@@ -1128,6 +1128,12 @@ class DataSourceEntitiesProcessor:
 
             async with self.data_store_provider.transaction() as tx_store:
                 for record, permissions in records_with_permissions:
+                    # Knowledge Forge patch 25 (#86): a folder has nothing to index. Create it in the
+                    # state the indexer's folder branch would have written after a queue round-trip.
+                    if isinstance(record, FileRecord) and record.is_file is False:
+                        record.indexing_status = ProgressStatus.COMPLETED.value
+                        record.extraction_status = ProgressStatus.COMPLETED.value
+                        record.reason = "Folder record \u2014 no content to index"
                     processed_record = await self._process_record(record, permissions, tx_store)
 
                     if processed_record:
@@ -1159,12 +1165,15 @@ class DataSourceEntitiesProcessor:
                 # KB folders carry no indexable content; they are created COMPLETED
                 # and must not emit a newRecord event (the indexing consumer would
                 # skip them anyway, but this avoids leaving them stuck non-COMPLETED).
-                if (
-                    record.origin == OriginTypes.UPLOAD
-                    and isinstance(record, FileRecord)
-                    and record.is_file is False
-                ):
-                    self.logger.debug(f"Skipping newRecord event for KB folder {record.id}")
+                # Knowledge Forge patch 25 (#86): every folder, not only KB ones. A folder whose
+                # eTag moved was reset to NOT_STARTED by _process_record; nothing consumes that, so
+                # set it back to COMPLETED (a CAS: it loses harmlessly if anything else wrote first).
+                if isinstance(record, FileRecord) and record.is_file is False:
+                    if record.indexing_status == ProgressStatus.NOT_STARTED.value:
+                        await self.data_store_provider.compare_and_set_indexing_status(
+                            [record.id], ProgressStatus.NOT_STARTED.value, ProgressStatus.COMPLETED.value
+                        )
+                    self.logger.debug(f"Skipping newRecord event for folder {record.id}")
                     continue
 
                 if record.is_placeholder:
@@ -1225,6 +1234,16 @@ class DataSourceEntitiesProcessor:
                     record.id,
                 )
                 return
+
+        # Knowledge Forge patch 25 (#86): a folder's eTag moves with its children; that is not
+        # content. After the commit (so the CAS cannot be overwritten by it), keep it COMPLETED
+        # and off the indexing stream.
+        if isinstance(processed_record, FileRecord) and processed_record.is_file is False:
+            if processed_record.indexing_status == ProgressStatus.NOT_STARTED.value:
+                await self.data_store_provider.compare_and_set_indexing_status(
+                    [processed_record.id], ProgressStatus.NOT_STARTED.value, ProgressStatus.COMPLETED.value
+                )
+            return
 
         # Publish after the transaction commits. Publishing inside it would put the
         # event on the topic even if the transaction went on to roll back.
