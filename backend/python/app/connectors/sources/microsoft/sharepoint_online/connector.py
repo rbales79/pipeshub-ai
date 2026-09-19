@@ -1194,8 +1194,12 @@ class SharePointConnector(BaseConnector):
                     # Create document library record
                     drive_record_group = self._create_document_library_record_group(drive, site_id, internal_site_record_group_id)
                     if drive_record_group:
-                        drive_record_groups_with_permissions.append((drive_record_group, []))
-                        # permissions = await self._get_drive_permissions(site_id, drive_id)
+                        # Restored: the permission fetch below was commented out upstream and an
+                        # empty list passed, which leaves the RecordGroup unreachable by the
+                        # knowledge-hub traversal (App -> Site -> Drive -> Record gates each hop).
+                        # Uses Graph, so no SharePoint REST grant is required. Fails soft to [].
+                        drive_permissions = await self._get_drive_permissions(site_id, drive_id)
+                        drive_record_groups_with_permissions.append((drive_record_group, drive_permissions))
 
             self.logger.info(f"Found {len(drive_record_groups_with_permissions)} drive record groups to process.")
             await self.data_entities_processor.on_new_record_groups(drive_record_groups_with_permissions)
