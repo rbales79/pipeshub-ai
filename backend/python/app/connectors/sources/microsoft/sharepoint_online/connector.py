@@ -3970,6 +3970,10 @@ class SharePointConnector(BaseConnector):
                 if batch_end < len(site_record_groups_with_permissions):
                     await asyncio.sleep(2)
 
+            # Knowledge Forge patch 36 (#47): only after a sync in which no site failed.
+            if not self.stats.get('sites_failed'):
+                await self._kf_delete_records_of_deleted_libraries()
+
             # Final statistics
             duration = datetime.now() - start_time
             self.logger.info(f"🎉 SharePoint connector sync completed in {duration}")
@@ -3989,6 +3993,77 @@ class SharePointConnector(BaseConnector):
             duration = datetime.now() - start_time
             self.logger.error(f"💥 Critical error in SharePoint connector after {duration}: {e}")
             raise
+
+    # Knowledge Forge patch 36 (#47): a deleted library is never in the site's drive list, so it
+    # is never visited and its records stay for ever. Ask Graph for each INDEXED drive by id and
+    # delete only on a definitive 404. Fails closed — see the patch docstring.
+    async def _kf_drive_state(self, drive_id: str) -> str:
+        try:
+            async with self.rate_limiter:
+                drive = await self.client.drives.by_drive_id(drive_id).get()
+            return "alive" if drive is not None else "unknown"
+        except Exception as e:
+            status = getattr(e, "response_status_code", None)
+            code = str(getattr(getattr(e, "error", None), "code", "") or "").lower()
+            if status == 404 and code in ("itemnotfound", ""):
+                return "gone"
+            self.logger.error(f"Deleted-library pass: drive {drive_id} answered {status} {code or e}")
+            return "unknown"
+
+    async def _kf_delete_records_of_deleted_libraries(self) -> int:
+        import os
+
+        try:
+            indexed = await self.data_entities_processor.get_records_by_record_type(
+                self.connector_id, RecordType.FILE
+            )
+            by_drive = {}
+            for record in indexed:
+                if record.external_record_group_id:
+                    by_drive.setdefault(record.external_record_group_id, []).append(record)
+            if not by_drive:
+                self.logger.info(f"Deleted-library pass: {len(indexed)} file record(s), none carries a drive id.")
+                return 0
+            states = {}
+            for drive_id in sorted(by_drive):
+                states[drive_id] = await self._kf_drive_state(drive_id)
+            if "unknown" in states.values():
+                self.logger.error("Deleted-library pass aborted, nothing deleted: a drive's state is unknown.")
+                return 0
+            gone = [d for d, s in states.items() if s == "gone"]
+            if not gone:
+                self.logger.info(f"Deleted-library pass: {len(states)} indexed drive(s), all alive.")
+                return 0
+            if len(gone) == len(states) and float(os.environ.get("KF_SOURCE_DELETE_MAX_FRACTION", "0.5")) < 1:
+                self.logger.error(
+                    f"Deleted-library pass REFUSED: all {len(states)} indexed drive(s) answered 404. That is what "
+                    f"a wrong tenant or a revoked grant looks like; nothing deleted. If every library really "
+                    f"was deleted, set KF_SOURCE_DELETE_MAX_FRACTION=1 for one sync."
+                )
+                return 0
+        except Exception as e:
+            self.logger.error(f"Deleted-library pass aborted, nothing deleted: {e}", exc_info=True)
+            return 0
+
+        deleted = 0
+        for drive_id in gone:
+            failed = 0
+            self.logger.info(
+                f"Library deleted at source ({drive_id}): deleting its {len(by_drive[drive_id])} record(s)"
+            )
+            for record in by_drive[drive_id]:
+                try:
+                    await self.data_entities_processor.on_record_deleted(record_id=record.id)
+                    deleted += 1
+                except Exception as e:
+                    failed += 1
+                    self.logger.error(f"Deleted-library pass: record {record.id} failed: {e}", exc_info=True)
+            if failed:
+                self.logger.error(f"Deleted-library pass: {failed} record(s) of {drive_id} remain; group kept.")
+                continue
+            await self.data_entities_processor.on_record_group_deleted(drive_id, self.connector_id)
+        self.logger.info(f"Deleted-library pass: {deleted} record(s) deleted from {len(gone)} librar(y/ies).")
+        return deleted
 
     async def run_incremental_sync(self) -> None:
         """Run incremental sync for SharePoint content."""
