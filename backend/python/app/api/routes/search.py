@@ -72,8 +72,17 @@ async def search(
         # Extract KB IDs from filters if present
         updated_filters = body.filters
 
-        # Setup query transformation
-        rewrite_chain, expansion_chain = setup_query_transformation(llm)
+        # Setup query transformation.
+        # Pin to temperature 0: the default is 0.2 (aimodels.py:1000), and 1 for
+        # reasoning models, so the rewrite and the expansions differ on every
+        # call and the same question returns different documents. Guarded --
+        # a provider that rejects the kwarg keeps the unbound model rather than
+        # failing the search outright.
+        try:
+            transform_llm = llm.bind(temperature=0)
+        except Exception:
+            transform_llm = llm
+        rewrite_chain, expansion_chain = setup_query_transformation(transform_llm)
 
         # Run query transformations in parallel
         rewritten_query, expanded_queries = await asyncio.gather(
@@ -87,7 +96,13 @@ async def search(
             q.strip() for q in expanded_queries.split("\n") if q.strip()
         ]
 
-        queries = [rewritten_query.strip()] if rewritten_query.strip() else []
+        # The user's literal query goes FIRST and always. Upstream includes it
+        # only when the rewrite comes back empty, so a verbatim match can lose
+        # to the model's paraphrase of it -- and the words the user actually
+        # chose are the one signal that is definitely about their intent.
+        queries = [body.query.strip()] if body.query.strip() else []
+        if rewritten_query.strip() and rewritten_query.strip() not in queries:
+            queries.append(rewritten_query.strip())
         queries.extend([q for q in expanded_queries_list if q not in queries])
         results = await retrieval_service.search_with_filters(
             queries=queries,
