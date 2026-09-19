@@ -1061,6 +1061,13 @@ class ExcelParser:
             ExcelHeaderDetection with has_headers, num_header_rows, confidence, and reasoning
         """
         self.logger.info(f"Detecting headers with LLM for {len(first_rows)} rows")
+        # Knowledge Forge patch 29 (#105): header detection counts against the same per-workbook
+        # cap. Past it, the first row is taken as the header -- its values still reach the index.
+        _kf_cap = max(0, int(os.getenv("MAX_TABLES_FOR_LLM", "20")))
+        if getattr(self, "_kf_header_llm_used", 0) >= _kf_cap:
+            return ExcelHeaderDetection(has_headers=True, num_header_rows=1, confidence="low",
+                                        reasoning="Knowledge Forge patch 29: past MAX_TABLES_FOR_LLM")
+        self._kf_header_llm_used = getattr(self, "_kf_header_llm_used", 0) + 1
         try:
             # Handle edge case: no rows available
             if not first_rows:
@@ -1142,6 +1149,11 @@ class ExcelParser:
             List of generated header names (always exactly column_count items)
         """
         self.logger.info(f"Generating headers with LLM for {column_count} columns using {len(sample_rows)} sample rows")
+        # Knowledge Forge patch 29 (#105): a 256-column generation call held a record 11+ min and
+        # took it past the 1800 s budget. Wide tables get positional names without a model call.
+        if column_count > max(1, int(os.getenv("EXCEL_HEADER_LLM_MAX_COLUMNS", "50"))):
+            self.logger.info(f"{column_count} columns exceeds EXCEL_HEADER_LLM_MAX_COLUMNS: positional headers")
+            return [f"Column_{i}" for i in range(1, column_count + 1)]
 
         try:
             # Format sample data for display
@@ -1425,7 +1437,16 @@ Respond with ONLY a JSON object with EXACTLY {column_count} headers:
         for table_idx, table in enumerate(tables, 1):
             self.logger.info(f"Processing table {table_idx}/{len(tables)} in sheet {sheet_name}")
             # Get table summary (always use LLM)
-            table_summary = await self.get_table_summary(table)
+            # Knowledge Forge patch 29 (#105): LLM work is capped by tables as well as rows. A
+            # workbook of 53+ small tables ran past the 1800 s record budget at ~25 s a table.
+            _kf_table_cap = max(0, int(os.getenv("MAX_TABLES_FOR_LLM", "20")))
+            _kf_llm_table = getattr(self, "_kf_llm_tables_used", 0) < _kf_table_cap
+            if _kf_llm_table:
+                self._kf_llm_tables_used = getattr(self, "_kf_llm_tables_used", 0) + 1
+                table_summary = await self.get_table_summary(table)
+            else:
+                self.logger.info(f"Table {table_idx} is past MAX_TABLES_FOR_LLM={_kf_table_cap}: no summary, simple row text")
+                table_summary = ""
 
             # Add current table rows to cumulative count
             table_row_count = len(table["data"])
@@ -1433,7 +1454,7 @@ Respond with ONLY a JSON object with EXACTLY {column_count} headers:
             self.logger.info(f"Table has {table_row_count} rows, cumulative count: {cumulative_row_count[0]}")
 
             # Check if cumulative count exceeds threshold
-            use_llm_for_rows = cumulative_row_count[0] <= threshold
+            use_llm_for_rows = cumulative_row_count[0] <= threshold and _kf_llm_table  # patch 29
 
             processed_rows = []
 
@@ -1529,6 +1550,8 @@ Respond with ONLY a JSON object with EXACTLY {column_count} headers:
 
         # Initialize cumulative row count for record-level threshold checking
         cumulative_row_count = [0]
+        self._kf_llm_tables_used = 0  # Knowledge Forge patch 29 (#105)
+        self._kf_header_llm_used = 0
 
         # Iterate sheets and build hierarchy
         assert self.workbook is not None, "Workbook must be loaded before calling get_blocks_from_workbook"
