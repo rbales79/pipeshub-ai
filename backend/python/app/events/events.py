@@ -603,6 +603,10 @@ class EventProcessor:
             if "block_groups" in parsed or "blocks" in parsed:
                 parts: list[str] = []
                 for bg in parsed.get("block_groups", []):
+                    # Knowledge Forge patch 37 (#44): 24 deals with one description and 24 different
+                    # names hashed the same and were stored as one. A heading is content.
+                    if bg.get("name"):
+                        parts.append(json.dumps({"name": bg["name"]}, sort_keys=True, default=str))
                     if bg.get("data") is not None:
                         parts.append(json.dumps(bg["data"], sort_keys=True, default=str))
                 for b in parsed.get("blocks", []):
