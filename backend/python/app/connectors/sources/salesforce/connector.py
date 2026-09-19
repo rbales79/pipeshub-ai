@@ -2740,6 +2740,9 @@ class SalesforceConnector(BaseConnector):
                 self.logger.info("Syncing permissions edges...")
                 await self._sync_permissions_edges(api_version=api_version)
 
+                # Knowledge Forge patch 33 (#134): last, so it only runs when every step above succeeded.
+                await self._kf_delete_records_missing_at_source(api_version=api_version)
+
                 self.logger.info("Salesforce full sync completed.")
 
             except Exception as ex:
@@ -6263,6 +6266,110 @@ class SalesforceConnector(BaseConnector):
         except Exception as e:
             self.logger.error(f"Error flattening group members: {e}", exc_info=True)
             return {}
+
+    # Knowledge Forge patch 33 (#134): every sync step is incremental by timestamp, so a
+    # row deleted in Salesforce is never seen. List what the source still has, and delete
+    # the indexed records it no longer does. Fails closed — see the patch docstring.
+    _KF_SOURCE_OBJECTS = (
+        (RecordType.DEAL, "Opportunity"),
+        (RecordType.CASE, "Case"),
+        (RecordType.PRODUCT, "Product2"),
+        (RecordType.TASK, "Task"),
+    )
+    _KF_SOURCE_DELETE_FLOOR = 10
+
+    # A row Salesforce itself reports as IsDeleted = true was deleted, not hidden (#134, #170).
+    async def _kf_confirmed_in_recycle_bin(self, api_version: str, sobject: str, ids: list) -> set:
+        safe = sorted({i for i in ids if i and len(i) == 18 and i.isalnum() and i.isascii()})
+        confirmed = set()
+        for i in range(0, len(safe), 200):
+            in_clause = "','".join(safe[i : i + 200])
+            async for page in self._soql_query_paginated(
+                api_version=api_version,
+                q=f"SELECT Id FROM {sobject} WHERE IsDeleted = true AND Id IN ('{in_clause}')",
+                queryAll=True,
+            ):
+                confirmed.update(row.get("Id") for row in page if row.get("Id"))
+        return confirmed
+
+    # Where the share limit cannot speak — an empty listing, or FLOOR or fewer missing — only what
+    # the Recycle Bin confirms is deleted. Hidden and deleted look the same from a listing (#170).
+    async def _kf_only_confirmed(self, api_version: str, sobject: str, label: str, missing: list, id_of) -> list:
+        import os
+
+        if os.environ.get("KF_SOURCE_DELETE_UNCONFIRMED") == "1":
+            self.logger.warning(
+                f"Source-delete pass: KF_SOURCE_DELETE_UNCONFIRMED=1 — {len(missing)} {label} record(s) "
+                f"deleted without Recycle Bin confirmation. Unset it after this sync."
+            )
+            return missing
+        binned = await self._kf_confirmed_in_recycle_bin(api_version, sobject, [id_of(r) for r in missing])
+        confirmed = [r for r in missing if id_of(r) in binned]
+        if len(confirmed) < len(missing):
+            self.logger.error(
+                f"Source-delete pass REFUSED for {label}: {len(missing) - len(confirmed)} of {len(missing)} "
+                f"missing record(s) are not in Salesforce's Recycle Bin, so hidden and deleted cannot be told "
+                f"apart. Those are left alone. Check the integration user's access; if they were hard-deleted "
+                f"or deleted over 15 days ago, set KF_SOURCE_DELETE_UNCONFIRMED=1 for one sync."
+            )
+        return confirmed
+
+    async def _kf_delete_records_missing_at_source(self, api_version: str) -> int:
+        import os
+
+        try:
+            max_fraction = float(os.environ.get("KF_SOURCE_DELETE_MAX_FRACTION", "0.5"))
+            plan = []
+            for record_type, sobject in self._KF_SOURCE_OBJECTS:
+                indexed = await self.data_entities_processor.get_records_by_record_type(
+                    self.connector_id, record_type
+                )
+                if not indexed:
+                    continue
+                live = set()
+                async for page in self._soql_query_paginated(
+                    api_version=api_version,
+                    q=f"SELECT Id FROM {sobject} WHERE IsDeleted = false",
+                    queryAll=True,
+                ):
+                    live.update(row.get("Id") for row in page if row.get("Id"))
+                missing = [r for r in indexed if r.external_record_id and r.external_record_id not in live]
+                if not missing:
+                    continue
+                if not live or len(missing) <= self._KF_SOURCE_DELETE_FLOOR:
+                    missing = await self._kf_only_confirmed(
+                        api_version, sobject, sobject, missing, lambda r: r.external_record_id
+                    )
+                    if not missing:
+                        continue
+                elif len(missing) > max_fraction * len(indexed):
+                    self.logger.error(
+                        f"Source-delete pass REFUSED for {sobject}: {len(missing)} of {len(indexed)} indexed "
+                        f"records are missing at the source, over the {max_fraction:.0%} limit. Nothing deleted. "
+                        f"If this is a real bulk delete, set KF_SOURCE_DELETE_MAX_FRACTION=1 for one sync."
+                    )
+                    continue
+                plan.append((sobject, missing))
+        except Exception as e:
+            self.logger.error(f"Source-delete pass aborted, nothing deleted: {e}", exc_info=True)
+            return 0
+
+        deleted = 0
+        for sobject, missing in plan:
+            for record in missing:
+                try:
+                    self.logger.info(
+                        f"Deleted at source, deleting record {record.id} ({sobject} {record.external_record_id})"
+                    )
+                    await self.data_entities_processor.on_record_deleted(record_id=record.id)
+                    deleted += 1
+                except Exception as e:
+                    self.logger.error(
+                        f"Source-delete of record {record.id} ({record.external_record_id}) failed: {e}",
+                        exc_info=True,
+                    )
+        self.logger.info(f"Source-delete pass: {deleted} record(s) deleted.")
+        return deleted
 
     async def run_incremental_sync(self) -> None:
         """
