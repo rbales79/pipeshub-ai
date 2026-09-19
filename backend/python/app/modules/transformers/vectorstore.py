@@ -1133,6 +1133,88 @@ class VectorStore(Transformer):
             return [None] * len(texts)
         return await embedder.embed_documents(texts)
 
+    # Embedder token ceiling. text-embedding-3-{small,large} accept 8191;
+    # ada-002 accepts 2048. Env-overridable so a smaller model can lower it.
+    _EMBED_TOKEN_LIMIT_DEFAULT = 8191
+    _EMBED_TOKEN_ENV = "PIPESHUB_EMBED_TOKEN_LIMIT"
+    # Fallback when no tokenizer resolves: English prose is ~4 chars/token, so 3
+    # is deliberately pessimistic — better a shorter input than a failed record.
+    _EMBED_CHARS_PER_TOKEN_FALLBACK = 3
+
+    def _embed_token_limit(self) -> int:
+        raw = os.getenv(self._EMBED_TOKEN_ENV)
+        if raw:
+            try:
+                v = int(raw)
+                if v > 0:
+                    return v
+            except ValueError:
+                pass
+        return self._EMBED_TOKEN_LIMIT_DEFAULT
+
+    def _truncate_texts_to_token_limit(
+        self, texts: List[str], record_id: str
+    ) -> List[str]:
+        """Clip any text over the embedder's token limit.
+
+        PipesHub sizes batches and blocks by characters and never counts tokens,
+        so a token-dense chunk can sit well under every character cap and still
+        exceed the model limit. The provider answers 400, the error is not
+        retriable, and the WHOLE RECORD is lost — for one long paragraph.
+
+        Truncating is the industry default (RAGFlow truncates to 8191; Vertex
+        AI's AUTO_TRUNCATE defaults to true). Every clip is logged: losing a tail
+        silently is a quality regression nobody would ever notice.
+        """
+        limit = self._embed_token_limit()
+        enc = None
+        try:
+            import tiktoken
+            model = getattr(self, "embedding_model_name", None) or getattr(self, "model_name", None)
+            try:
+                enc = tiktoken.encoding_for_model(model) if model else None
+            except Exception:
+                enc = None
+            if enc is None:
+                enc = tiktoken.get_encoding("cl100k_base")
+        except Exception as e:
+            self.logger.debug("tiktoken unavailable (%s); using character estimate", e)
+
+        out, clipped = [], 0
+        for text in texts:
+            if not text:
+                out.append(text)
+                continue
+            if enc is not None:
+                toks = enc.encode(text, disallowed_special=())
+                if len(toks) <= limit:
+                    out.append(text)
+                    continue
+                out.append(enc.decode(toks[:limit]))
+                clipped += 1
+                self.logger.warning(
+                    "Embedding input truncated for record %s: %d -> %d tokens (%.1f%% dropped)",
+                    record_id, len(toks), limit, 100.0 * (len(toks) - limit) / len(toks),
+                )
+            else:
+                cap = limit * self._EMBED_CHARS_PER_TOKEN_FALLBACK
+                if len(text) <= cap:
+                    out.append(text)
+                    continue
+                out.append(text[:cap])
+                clipped += 1
+                self.logger.warning(
+                    "Embedding input truncated for record %s by character estimate: %d -> %d chars",
+                    record_id, len(text), cap,
+                )
+        if clipped:
+            self.logger.warning(
+                "Record %s: %d of %d chunk(s) exceeded the %d-token embedder limit and were clipped. "
+                "The clipped tail is not retrievable — token-aware chunking is the real fix.",
+                record_id, clipped, len(texts), limit,
+            )
+        return out
+
     async def _embed_documents_with_retry(
         self, texts: List[str], record_id: str
     ) -> List[List[float]]:
@@ -1151,13 +1233,14 @@ class VectorStore(Transformer):
             else _REMOTE_EMBEDDING_BATCH_TIMEOUT_S
         )
         service_name = self.embedding_provider or EmbeddingProvider.DEFAULT.value
-        total_chars = sum(len(text) for text in texts)
+        safe_texts = self._truncate_texts_to_token_limit(texts, record_id)
+        total_chars = sum(len(text) for text in safe_texts)
         last_error: BaseException | None = None
 
         for attempt in range(1, _EMBEDDING_BATCH_MAX_ATTEMPTS + 1):
             try:
                 return await asyncio.wait_for(
-                    self.dense_embeddings.aembed_documents(texts),
+                    self.dense_embeddings.aembed_documents(safe_texts),
                     timeout=attempt_timeout,
                 )
             except asyncio.TimeoutError as e:
