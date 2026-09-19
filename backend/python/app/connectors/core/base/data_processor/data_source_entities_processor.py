@@ -1210,6 +1210,22 @@ class DataSourceEntitiesProcessor:
                 )
                 return
 
+            # Knowledge Forge patch 24 (#114, #101): _process_record carries COMPLETED forward only
+            # when the stored record is indexed and its revision (SharePoint: eTag) is unchanged --
+            # the case on_new_records already skips. Without this, every full sync re-published
+            # every hashed SharePoint file. A record with no revision id keeps upstream behaviour:
+            # for those connectors this call is the only content-change signal. Permission edges
+            # are refreshed by on_updated_record_permissions, a separate call, and are unaffected.
+            if (
+                processed_record.indexing_status == ProgressStatus.COMPLETED.value
+                and processed_record.external_revision_id
+            ):
+                self.logger.info(
+                    "Skipping updateRecord for %s: revision unchanged and already COMPLETED",
+                    record.id,
+                )
+                return
+
         # Publish after the transaction commits. Publishing inside it would put the
         # event on the topic even if the transaction went on to roll back.
         await self.messaging_producer.send_message(
