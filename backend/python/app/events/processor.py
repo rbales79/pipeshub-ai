@@ -1300,7 +1300,9 @@ class Processor:
         try:
             self.logger.debug("📊 Processing Excel content")
             llm, _ = await self._get_llm_for_role("indexing", reasoning_effort="low")
-            parser = self.parsers[ExtensionTypes.XLSX.value]
+            # Knowledge Forge patch 23 (#117): a parser per record. The shared instance keeps the
+            # workbook on self, so a concurrent record swapped it mid-parse (lost and foreign rows).
+            parser = type(self.parsers[ExtensionTypes.XLSX.value])(self.logger, self.config_service)
             if not excel_binary:
                 self.logger.info(f"No Excel binary found for record: {recordName}")
                 await self._mark_record(recordId, ProgressStatus.EMPTY)

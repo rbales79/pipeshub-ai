@@ -381,8 +381,11 @@ class ExcelParser:
             llm, _ = await get_llm_for_role(self.config_service, "indexing", reasoning_effort="low")
             # openpyxl's load is synchronous and can take seconds on large
             # workbooks; keep it off the event loop.
-            await asyncio.to_thread(self.load_workbook_from_binary, content)
-            blocks_containers = await self.create_blocks(llm)
+            # Knowledge Forge patch 23 (#117): parse on a fresh instance. This object is shared
+            # (parsers registry, eml attachments), and the workbook lives on the instance.
+            worker = ExcelParser(self.logger, self.config_service)
+            await asyncio.to_thread(worker.load_workbook_from_binary, content)
+            blocks_containers = await worker.create_blocks(llm)
 
             return ParseResult(
                 block_container=blocks_containers,
